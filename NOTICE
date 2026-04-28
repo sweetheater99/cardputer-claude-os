@@ -1,0 +1,15 @@
+m5stack
+Copyright 2026 MAS Event + Design, LLC
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product bundles third-party software in `onboard/scripts/vendor/`.
+Those packages retain their original licenses, which are NOT Apache 2.0.
+See LICENSE-THIRD-PARTY.md for the full inventory.
+
+Notably, `esptool` is licensed under the GNU General Public License v2 or
+later (GPLv2+). It is invoked only as a separate subprocess
+(`python -m esptool ...`) and is not statically linked or imported by this
+project's source code, so it is bundled as an aggregated work. Users who
+redistribute this repository must comply with esptool's GPL terms for
+that component.

@@ -1,0 +1,277 @@
+"""Claude Buddy for the M5 Cardputer-Adv.
+
+This is a port of the Basic's `buddy_app.py` to a device with a QWERTY
+matrix keyboard instead of three face buttons, a 240x135 LCD instead of
+320x240, and no accessible battery IC (Cardputer-Adv ships with a
+different power rail that we don't bother reading here). The wire
+protocol, BLE stack, persistent state, and character-receive logic are
+unchanged — we reuse `buddy_ble`, `buddy_protocol`, `buddy_state`, and
+`buddy_chars` byte-for-byte from the Basic build. Only the I/O layer
+(input → UI) is Cardputer-specific.
+
+### Install layout
+
+UIFlow 2.0's launcher shows any `*.py` inside `/flash/apps/` in its
+"App List" menu. The peer modules go alongside this file in the same
+directory, and we prepend `/flash/apps/` to sys.path on entry so
+`import buddy_ble` etc. resolves. This keeps the whole bundle
+self-contained in one folder — no touching /flash/ root, no clobbering
+UIFlow's own main.py/boot.py.
+
+### Input mapping
+
+The Cardputer has a full keyboard, so we pick intuitive letters rather
+than mimicking BtnA/B/C. The mapping is shown in the hint strip:
+
+  Y / y / Enter   → approve once
+  N / n           → deny
+  Q / q / ESC     → quit back to the UIFlow App List
+
+MatrixKeyboard.get_key() returns single-character strings for printable
+keys and small integer codes for specials. We accept both forms for the
+keys that have both — Enter (0x0D) and Escape (0x1B).
+
+### Return-to-menu
+
+UIFlow 2.0 has no return-to-launcher API; when a user app's `run()`
+ends, the launcher does not repaint and the screen stays frozen on
+whatever the app drew last. The established workaround (see
+`hello_cardputer.py`) is to soft-reboot via `machine.reset()` on exit,
+which lands the user back at the launcher automatically. We do that
+here, in the `finally` block, *after* tearing BLE down cleanly.
+"""
+
+import sys
+
+# Make our peer modules importable *before* the first `import buddy_ble`
+# below, otherwise we ImportError at load time and the launcher has no
+# graceful way to show it.
+#
+# UIFlow 2.0's default sys.path on this build is roughly:
+#   ['', '.frozen', '/lib', '/system', '/flash/libs']
+# Notably /flash itself is NOT on the path, even though that's where
+# boot.py and main.py live. We put the buddy_* peer modules at /flash/
+# root (to keep them out of the App List, which scans /flash/apps/),
+# and claude_buddy.py lives in /flash/apps/. Prepend both so imports
+# resolve regardless of which layout a future install lands on.
+for _p in ("/flash", "/flash/apps"):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import time
+
+import M5
+import machine
+from hardware import MatrixKeyboard
+
+import buddy_ble
+import buddy_chars
+import buddy_protocol
+import buddy_state
+import buddy_ui_cp as buddy_ui
+
+
+# ---- battery stub
+#
+# The Basic's buddy_app.py talks to an IP5306 over I2C(0, sda=21,
+# scl=22). The Cardputer-Adv has a completely different power
+# architecture — there's no IP5306, and the battery/USB state lives in
+# a chip we haven't wired up here. Stub the reader out so the protocol
+# and UI layers still see the shape they expect; the footer will show
+# "100%  USB" steady-state, which is a deliberate lie but a benign one.
+# A follow-up can swap this for the real AXP2101/AW9523 reader once
+# someone digs out the register map.
+def _stub_battery():
+    return {"pct": 100, "mV": 0, "mA": 0, "usb": True}
+
+
+# ---- key adapter
+#
+# We translate the raw key from MatrixKeyboard into one of three
+# intents: APPROVE / DENY / QUIT / None. That keeps the main loop dumb
+# — it doesn't care which key was pressed, just what it means. Picking
+# the mapping here (rather than sprinkling magic constants through the
+# loop) also makes it trivial to add synonyms later (e.g. space = once).
+_INTENT_APPROVE = "approve"
+_INTENT_DENY = "deny"
+_INTENT_QUIT = "quit"
+
+
+def _intent_for_key(k):
+    """Return an intent string or None for an unrecognized key.
+
+    MatrixKeyboard.get_key() on this UIFlow 2.0 build hands back the
+    raw ASCII byte value as an **int** — e.g. 0x59 for 'Y', 0x6E for
+    'n', 0x0D for Enter, 0x1B for Escape. This is different from some
+    older builds where it returned a length-1 string, so we accept
+    both forms: ints in the printable range 0x20..0x7E are converted
+    to their single-char string and then fall through to the string
+    matcher below. That way we get one place that enumerates the
+    key→intent map.
+
+    The previous version of this function treated every int except
+    0x0D / 0x1B as unknown, which silently dropped every Y/N/Q press
+    — that's the "keyboard buttons don't work" symptom we saw on
+    hardware.
+    """
+    if k is None:
+        return None
+    if isinstance(k, int):
+        if k == 0x0D:
+            return _INTENT_APPROVE
+        if k == 0x1B:
+            return _INTENT_QUIT
+        if 0x20 <= k <= 0x7E:
+            k = chr(k)
+        else:
+            return None
+    if isinstance(k, (bytes, bytearray)) and len(k) == 1:
+        k = chr(k[0])
+    if not isinstance(k, str) or not k:
+        return None
+    ch = k.lower()
+    if ch in ("y", "\r", "\n"):
+        return _INTENT_APPROVE
+    if ch == "n":
+        return _INTENT_DENY
+    if ch in ("q", "\x1b"):
+        return _INTENT_QUIT
+    return None
+
+
+def run():
+    ui = buddy_ui.BuddyUI()
+    state = buddy_state.BuddyState()
+    ui.update_identity(state.name, state.owner)
+
+    buddy_chars.sweep_partials()
+    chars = buddy_chars.CharReceiver()
+
+    # Protocol needs a handle on the BLE object (for disconnect /
+    # forget_bonds), and BLE needs the on_line callback which needs the
+    # protocol. Same indirection trick as the Basic: stash the protocol
+    # in a 1-slot dict that the callback reads at event time.
+    proto_holder = {"p": None}
+
+    def on_line(raw):
+        p = proto_holder["p"]
+        if p is not None:
+            p.on_line(raw)
+
+    def on_passkey(pk):
+        ui.show_passkey(pk)
+
+    def on_state_change(s):
+        # The stripped UIFlow 2.0 BLE build doesn't fire
+        # _IRQ_ENCRYPTION_UPDATE, so "connected" is terminal. Remap
+        # it to "encrypted" so the UI advances past the PAIR... badge
+        # and the protocol starts emitting its hello.
+        effective = s
+        if s == "connected" and not ble.pairing_supported:
+            effective = "encrypted"
+        print("claude_buddy: state", s, "->", effective)
+        ui.set_connection(effective)
+        if effective == "encrypted":
+            ui.clear_passkey()
+            p = proto_holder["p"]
+            if p is not None:
+                p.send_hello()
+
+    ble = buddy_ble.BuddyBLE(
+        on_line=on_line,
+        on_passkey=on_passkey,
+        on_state=on_state_change,
+    )
+
+    proto = buddy_protocol.BuddyProtocol(
+        state=state,
+        ui=ui,
+        chars=chars,
+        ble=ble,
+        battery_reader=_stub_battery,
+    )
+    proto_holder["p"] = proto
+
+    ui.update_footer(state.stats(), _stub_battery())
+    print("Claude Buddy up as", ble.advertised_name)
+
+    # Keyboard: debounce 400 ms before polling so the key used to pick
+    # this app from App List doesn't count as an intent. Same pattern
+    # hello_cardputer.py uses — confirmed by testing there that
+    # MatrixKeyboard.get_key() is reliable inside an app context as
+    # long as we tick() before reading.
+    kb = MatrixKeyboard()
+    time.sleep_ms(400)
+
+    last_footer_ms = time.ticks_ms()
+    last_toast_ms = 0
+    footer_interval = 3000
+    toast_dwell_ms = 1500
+
+    try:
+        while True:
+            kb.tick()
+            k = kb.get_key()
+            intent = _intent_for_key(k)
+
+            if intent == _INTENT_APPROVE:
+                if not proto.send_permission("once"):
+                    ui.flash_toast("Y: no prompt", buddy_ui.GRAY_DIM)
+                    ui.update_footer(state.stats(), _stub_battery())
+                last_toast_ms = time.ticks_ms()
+            elif intent == _INTENT_DENY:
+                if not proto.send_permission("deny"):
+                    ui.flash_toast("N: no prompt", buddy_ui.GRAY_DIM)
+                last_toast_ms = time.ticks_ms()
+            elif intent == _INTENT_QUIT:
+                # Break out so the `finally` block tears BLE down
+                # cleanly before we reboot back to the launcher.
+                return
+
+            now = time.ticks_ms()
+            if time.ticks_diff(now, last_footer_ms) >= footer_interval:
+                state.tick_nap()
+                ui.update_footer(state.stats(), _stub_battery())
+                last_footer_ms = now
+            if last_toast_ms and time.ticks_diff(now, last_toast_ms) >= toast_dwell_ms:
+                ui.restore_button_hints()
+                last_toast_ms = 0
+
+            # 40 ms matches buddy_app.py — fast enough for responsive
+            # key handling, slow enough that the BLE IRQ gets plenty
+            # of room. MatrixKeyboard handles debounce internally on
+            # tick(), so no additional delay is needed for the input
+            # path specifically.
+            time.sleep_ms(40)
+    finally:
+        # Mirror buddy_app.py's teardown ordering: BLE first so a late
+        # async disconnect event can't repaint Buddy chrome on top of
+        # the launcher (cf. the comment in BuddyBLE.deinit), then wipe
+        # the screen to black, then hand control back to UIFlow.
+        try:
+            ble.deinit()
+        except Exception as e:
+            print("claude_buddy: deinit warning:", e)
+        try:
+            M5.Lcd.fillScreen(buddy_ui.BLACK)
+        except Exception as e:
+            print("claude_buddy: screen-clear warning:", e)
+        # UIFlow has no launcher-return API; machine.reset() is the
+        # only way back to App List. Same pattern hello_cardputer.py
+        # uses. Brief pause so any trailing BLE log doesn't get
+        # truncated mid-line on the USB console.
+        time.sleep_ms(200)
+        machine.reset()
+
+
+# UIFlow's App List invokes user apps by running the file, not by
+# calling run(). Guard with __name__ so importing this module for
+# tests/inspection doesn't immediately spin up BLE.
+if __name__ == "__main__":
+    run()
+else:
+    # When the launcher imports us (vs. runs us as __main__), call run()
+    # explicitly. UIFlow 2.4.x has been observed to do both depending on
+    # how the app was selected; calling run() from here is idempotent
+    # because run() itself is the only place that wires BLE up.
+    run()
