@@ -29,6 +29,7 @@
 import {
   AnthropicError,
   archiveSession as anthropicArchiveSession,
+  bindEnv,
   deleteSession,
   getSession,
   listEvents,
@@ -188,6 +189,13 @@ export class SessionRouter {
   }
 
   async fetch(request) {
+    // DO has its own isolate → its own anthropic.js module state.
+    // Re-bind the CF Access service-token creds so outbound calls
+    // (sendEvents, etc.) to agent.shortcutly.co include the headers.
+    // Without this, the DO's first outbound call gets the CF Access
+    // login HTML page (403) and the spawn flow dies.
+    bindEnv(this.env);
+
     const url = new URL(request.url);
     const action =
       url.searchParams.get("action") || url.pathname.replace(/^\//, "");

@@ -8,17 +8,52 @@
 // We only depend on global fetch — no SDK — so the same code runs in
 // the Worker isolate and in the DO isolate without bundler tricks.
 
-const BASE = "https://api.anthropic.com";
+// Routes Anthropic Managed Agents calls to the Mac Mini's
+// `claude-agent-runner` which exposes the same /v1/agents,
+// /v1/environments, /v1/sessions surface but executes via
+// `claude -p` under Pro Max — $0 marginal cost. The Mini
+// accepts the Worker's existing `x-api-key` header (its TOKEN
+// value, set as the Worker's ANTHROPIC_API_KEY secret).
+//
+// To temporarily route back to Anthropic's own API (e.g. for
+// debugging Managed Agents behavior), flip this back to
+// "https://api.anthropic.com" and put a real sk-ant- key in
+// the ANTHROPIC_API_KEY secret.
+const BASE = "https://agent.shortcutly.co";
 const VERSION = "2023-06-01";
 const BETA = "managed-agents-2026-04-01";
 
+// Module-level cache of the CF Access service-token credentials. Set
+// once per request by the Worker entry point (worker.js fetch handler)
+// via bindEnv(env) so every downstream _call() can attach the headers
+// without each export needing an env parameter. Workers reuse one
+// `env` object across all requests within a deployment, so this
+// shared cell is safe — no per-request state crosses.
+let _cfAccessId = null;
+let _cfAccessSecret = null;
+
+export function bindEnv(env) {
+  _cfAccessId = (env && env.CF_ACCESS_CLIENT_ID) || null;
+  _cfAccessSecret = (env && env.CF_ACCESS_CLIENT_SECRET) || null;
+}
+
 function headers(apiKey) {
-  return {
+  const h = {
     "x-api-key": apiKey,
     "anthropic-version": VERSION,
     "anthropic-beta": BETA,
     "content-type": "application/json",
   };
+  // When BASE points at the Mac Mini (agent.shortcutly.co), it sits
+  // behind a Cloudflare Access service-token gate. Forward the
+  // service-token credentials so the upstream sees us as an
+  // authenticated service caller, not a browser user (which would
+  // be 403'd into the login HTML page).
+  if (_cfAccessId && _cfAccessSecret) {
+    h["CF-Access-Client-Id"] = _cfAccessId;
+    h["CF-Access-Client-Secret"] = _cfAccessSecret;
+  }
+  return h;
 }
 
 async function _json(resp) {

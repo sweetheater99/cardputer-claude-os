@@ -14,6 +14,7 @@
 // Both surfaces auth via the same DEVICE_SECRET, sent as
 // `x-device-secret` (device-side) or `?token=...` (browser).
 
+import { bindEnv } from "./anthropic.js";
 import {
   authenticate,
   handleConfirm,
@@ -47,6 +48,13 @@ const CHAT_SYSTEM_PROMPT =
 const CHAT_MODEL = "claude-haiku-4-5-20251001";
 const HISTORY_MAX_MESSAGES = 8;
 const HISTORY_TTL_SECONDS = 24 * 3600;
+
+// Routes /ask + /ask-text through the Mac Mini's claude-agent-runner
+// instead of api.anthropic.com so Push-to-Claude is billed to Pro Max
+// ($0) rather than the Anthropic Messages API. Mini exposes /v1/messages
+// with the same request/response shape — see managed_agents.py on the
+// Mini. Keep this in sync with BASE in src/anthropic.js.
+const CHAT_BASE = "https://agent.shortcutly.co";
 
 function authOk(request, env) {
   return request.headers.get("x-device-secret") === env.DEVICE_SECRET;
@@ -83,13 +91,23 @@ async function callHaiku(env, deviceSecret, userMessage) {
   const history = await getHistory(env, deviceSecret);
   const messages = [...history, { role: "user", content: userMessage }];
 
-  const claudeResp = await fetch("https://api.anthropic.com/v1/messages", {
+  const chatHeaders = {
+    "content-type": "application/json",
+    "x-api-key": env.ANTHROPIC_API_KEY,
+    "anthropic-version": "2023-06-01",
+  };
+  // CHAT_BASE points at the Mac Mini behind a Cloudflare Access
+  // service-token gate. Without these headers the upstream returns
+  // the CF Access login HTML page (403). The shared-cell pattern in
+  // anthropic.js doesn't apply here because callHaiku doesn't go
+  // through that module — set headers directly.
+  if (env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET) {
+    chatHeaders["CF-Access-Client-Id"] = env.CF_ACCESS_CLIENT_ID;
+    chatHeaders["CF-Access-Client-Secret"] = env.CF_ACCESS_CLIENT_SECRET;
+  }
+  const claudeResp = await fetch(CHAT_BASE + "/v1/messages", {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
+    headers: chatHeaders,
     body: JSON.stringify({
       model: CHAT_MODEL,
       max_tokens: 250,
@@ -128,11 +146,23 @@ async function handleAsk(request, env) {
   form.append("model", "whisper-1");
   form.append("response_format", "text");
 
+  // STT now runs on the Mac Mini's voice-stack (mlx_whisper +
+  // whisper-large-v3-turbo, GPU-accelerated) instead of OpenAI's
+  // paid Whisper API. CHAT_BASE points at the CF-tunneled Mini;
+  // CF Access service-token headers gate the upstream, same as the
+  // /v1/messages and /v1/sessions paths.
+  const whisperHeaders = {
+    "x-api-key": env.ANTHROPIC_API_KEY || "cardputer",
+  };
+  if (env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET) {
+    whisperHeaders["CF-Access-Client-Id"] = env.CF_ACCESS_CLIENT_ID;
+    whisperHeaders["CF-Access-Client-Secret"] = env.CF_ACCESS_CLIENT_SECRET;
+  }
   const whisperResp = await fetch(
-    "https://api.openai.com/v1/audio/transcriptions",
+    CHAT_BASE + "/v1/audio/transcriptions",
     {
       method: "POST",
-      headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+      headers: whisperHeaders,
       body: form,
     },
   );
@@ -230,6 +260,12 @@ const PAGER_ROUTES = {
 
 export default {
   async fetch(request, env) {
+    // Cache CF Access service-token creds in anthropic.js module
+    // scope so its outbound calls to agent.shortcutly.co (Mac Mini)
+    // include the headers without each export needing to thread env
+    // through. Idempotent; per-request `env` is the same singleton.
+    bindEnv(env);
+
     const url = new URL(request.url);
     const key = `${request.method} ${url.pathname}`;
 

@@ -490,6 +490,33 @@ def _record_to_file(kb):
     except OSError:
         pass
 
+    # I2S port handoff: on this Cardputer build, M5.begin() at boot
+    # claims I2S port 0 for the Speaker. Calling M5.Mic.begin() then
+    # silently captures into a buffer of zeros (`recordWavFile` returns
+    # True, file is the right size, but every sample is 0). Explicitly
+    # releasing the speaker before mic init lets the I2S subsystem
+    # rewire for PDM RX. The mic then captures real audio.
+    # PDM mic also needs over_sampling >= 16 to reconstruct meaningful
+    # samples from the 1-bit PDM stream; the default of 1 produces
+    # silence-shaped output. dma_buf_len/count widened to give a
+    # comfortable ring at 16 kHz.
+    try:
+        M5.Speaker.end()
+        time.sleep_ms(100)
+    except Exception as e:
+        print("p2c: speaker.end warn:", e)
+
+    try:
+        cfg = M5.Mic.config()
+        cfg.magnification = 16
+        cfg.noise_filter_level = 0
+        cfg.over_sampling = 16
+        cfg.dma_buf_len = 256
+        cfg.dma_buf_count = 4
+        M5.Mic.config(cfg)
+    except Exception as e:
+        print("p2c: mic.config warn:", e)
+
     M5.Mic.begin()
     try:
         try:
@@ -716,6 +743,41 @@ def _post_text(prompt):
             pass
 
 
+def _wav_peak_amplitude(path):
+    """Scan the captured WAV body and return its peak abs amplitude.
+    Used to detect a silent-mic capture before wasting a Worker call
+    on a WAV that Whisper will hallucinate over. Cheap — we read in
+    2 KB chunks and short-circuit once we see a value above the
+    silence threshold."""
+    try:
+        f = open(path, "rb")
+    except OSError:
+        return 0
+    peak = 0
+    try:
+        f.seek(44)  # skip RIFF/fmt/data headers
+        while True:
+            chunk = f.read(2048)
+            if not chunk:
+                break
+            for i in range(0, len(chunk) - 1, 2):
+                v = chunk[i] | (chunk[i + 1] << 8)
+                if v >= 32768:
+                    v -= 65536
+                a = -v if v < 0 else v
+                if a > peak:
+                    peak = a
+                if peak > 800:
+                    # Early exit — definitely real audio.
+                    return peak
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+    return peak
+
+
 def _post_recording():
     """Read the captured WAV and POST it. Returns the parsed JSON dict
     on success; raises on any failure (including an empty file).
@@ -732,6 +794,24 @@ def _post_recording():
     if size <= 44:
         raise RuntimeError("empty recording")
 
+    # Silent-mic guard. On this Cardputer/UIFlow 2.0 build, the PDM
+    # mic init in M5.Mic.recordWavFile silently fails — produces a
+    # well-formed WAV of zeros regardless of input. Uploading that
+    # makes Whisper hallucinate a generic "Thank you" / "Thanks for
+    # watching" filler, which then biases the chat. Detect upstream
+    # and refuse to upload silence so the user gets a clear error
+    # rather than nonsense replies.
+    #
+    # Threshold: 200 of 32768 (~0.6% full scale). Real speech easily
+    # peaks above this; ambient room noise on a working mic also
+    # exceeds it.
+    peak = _wav_peak_amplitude(_AUDIO_PATH)
+    if peak < 200:
+        raise RuntimeError(
+            "mic silent (peak={}). Codec init issue on this build — "
+            "use the keyboard to type your prompt instead.".format(peak)
+        )
+
     _free_internal_ram()
 
     file_size = os.stat(_AUDIO_PATH)[6]
@@ -741,9 +821,14 @@ def _post_recording():
         "content-type": "audio/wav",
         "x-device-secret": DEVICE_SECRET,
     }
-    _draw_uploading("transcribing", "speaking to Whisper")
+    # Server-side path: WAV → CF Worker → Mac Mini Whisper (mlx,
+    # GPU) → claude -p Haiku. Round trip on this network is typically
+    # 30-60 s including device-side TLS handshake. Give it 180 s of
+    # headroom so a first-call model warm-up doesn't surface as
+    # "nothing happens".
+    _draw_uploading("transcribing", "Whisper + Claude (up to 2m)")
     status, resp_body = _https_post_file_stream(
-        WORKER_URL, _AUDIO_PATH, headers, chunk_size=2048, timeout_s=60,
+        WORKER_URL, _AUDIO_PATH, headers, chunk_size=2048, timeout_s=180,
     )
     gc.collect()
     _draw_uploading("got reply", "decoding")
