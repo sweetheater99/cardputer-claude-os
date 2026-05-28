@@ -8,11 +8,18 @@ rates, and different MCP-client expectations.
 
 ## Status
 
-Iteration 1: documented, not yet implemented. The device-side scaffold
-in `cardputer_mcp.py` does not register the GATT service yet; the
-host-side `mcp/server.py` has the transport stubbed to stderr. This
-file pins the design so iter 2 can wire both sides against a fixed
-contract.
+Implemented through iter 5. `notify`, `ask`, and `confirm` work
+end-to-end over BLE (device `cardputer_mcp.py` ↔ host `mcp/server.py`).
+The host now speaks MCP over **two transports** to the same `Bridge`
+and the same device:
+
+- **stdio** — the original local path (`claude mcp add cardputer …`).
+- **streamable-http** — `CARDPUTER_HTTP=1`, a long-lived daemon on
+  `127.0.0.1:9000` that local Claude Code reaches over loopback and
+  cloud agents reach through an MCP tunnel (`tunnel/`). See
+  `/tunnel/README.md` and `/docs/superpowers/specs/`.
+
+This file pins the BLE wire contract both transports share.
 
 ## Transport
 
@@ -36,13 +43,21 @@ for `a5cd` to catch every place it's referenced.
 
 ## Authentication
 
-Same constraints as Buddy: UIFlow 2.0's MicroPython build strips the
-pairing API, so the link is unauthenticated on today's firmware.
-We rely on a per-device confirmation gesture (described under the
-`confirm` tool) for any destructive operation, and we never accept
-file pushes over MCP — there's simply no `file` / `chunk` command in
-this protocol. See `protocol.md` § Authentication for the broader
-discussion that applies here too.
+The **BLE link** is unauthenticated: UIFlow 2.0's MicroPython build
+strips the pairing API. We rely on a per-device confirmation gesture
+(described under the `confirm` tool) for any destructive operation, and
+we never accept file pushes over MCP — there's simply no `file` /
+`chunk` command in this protocol. See `protocol.md` § Authentication for
+the broader discussion that applies here too.
+
+The **HTTP transport** is a different story: an MCP tunnel carries
+encrypted traffic to the daemon but does not authenticate to it, so the
+daemon requires a **bearer token** on every request (`mcp/auth.py`).
+Each token maps to a short agent label (`claude-code`, `managed-agent`,
+…) that becomes the `agent` field below — so the device banner shows
+_which_ agent is asking, sourced from the authenticated token rather
+than caller-supplied text. An empty token map denies everything (fail
+closed). Configure tokens via `CARDPUTER_TOKENS=token=label,…`.
 
 ## Inbound (host → device)
 
@@ -59,13 +74,16 @@ in-flight requests.
 | `cancel`  | `{"cmd":"cancel","id":"...","target_id":"..."}`                                                 | Cancel a pending `ask` / `confirm`. Ack with cancellation state.                                                               |
 | `ping`    | `{"cmd":"ping","id":"..."}`                                                                     | Round-trip liveness check.                                                                                                     |
 
-The `agent` field carries a short tag (`"claude-code"`, `"cursor"`,
-`"managed-agent:sesn_..."` etc.) that the device uses to:
+The `agent` field carries a short tag (`"claude-code"`, `"managed-agent"`,
+`"local"`, etc.). Over the HTTP transport it's set from the caller's
+bearer token (`mcp/auth.py`), not from anything in the tool arguments,
+so it can't be forged. The device:
 
-- attribute notifications in the history view
-- apply the per-agent rate limit (~1 notify per 60 s; `crit`
-  notifications and blocking tools bypass the limit)
-- route blocking-tool focus when multiple agents are paired
+- **renders it on the `ask` / `confirm` banner** (`from:<agent>`) so the
+  user sees who is asking before answering or holding Y — _implemented_
+- could attribute notifications in a history view — _future_
+- could apply a per-agent rate limit (~1 notify per 60 s; `crit` and
+  blocking tools bypass) — _future; restraint is self-imposed today_
 
 ## Outbound (device → host)
 

@@ -6,11 +6,20 @@ description: Use when the cardputer MCP tools (notify, ask, confirm) are availab
 # Cardputer Companion
 
 The Cardputer is a credit-card-sized handheld the user carries in their pocket.
-It exposes three MCP tools over a local BLE bridge — `notify`, `ask`, and
-`confirm` — provided by the `cardputer` MCP server in this repo (`mcp/server.py`).
-Those tools are the _hands_. This skill is the _manners_: it tells you **when**
-to reach for them and **how** to shape what you send, so the device stays useful
+It exposes three MCP tools over a BLE bridge — `notify`, `ask`, and `confirm` —
+provided by the `cardputer` MCP server in this repo (`mcp/server.py`). Those
+tools are the _hands_. This skill is the _manners_: it tells you **when** to
+reach for them and **how** to shape what you send, so the device stays useful
 instead of annoying.
+
+**These rules apply no matter where you run.** The same tools reach the same
+device whether you're local Claude Code over loopback or a cloud Managed Agent /
+Messages-API agent over an MCP tunnel (`tunnel/`). If anything, restraint and the
+fail-closed `confirm` discipline matter **more** when you're an unattended cloud
+agent — the user isn't watching a terminal, and the physical gesture is the only
+thing standing between you and an irreversible mistake. The device shows **which
+agent is asking** on every `ask`/`confirm` banner (derived from your bearer
+token, so you can't misrepresent it) — keep your requests honest and legible.
 
 ## Core ethos: default to silence
 
@@ -80,12 +89,28 @@ The LCD is **240×135 pixels**. Whatever you send must read in a glance:
 - Spell out the outcome in plain words; the user can't scroll a banner.
 - Lead with the result, details second.
 
+## 5. Do Not Disturb — respect it
+
+The user can put the device in Do Not Disturb (a `DND` chip shows on its idle
+screen). When they have:
+
+- `notify` (non-critical) and `ask` return `"dnd"`. Treat it as "the user is
+  heads-down": do **not** retry or escalate; degrade to normal chat / logging
+  and carry on. For `ask`, pick the safe default or proceed without the device
+  rather than looping.
+- `crit` notifications and **`confirm` still ring** — DND never weakens the
+  destructive-op gate. If you genuinely need a `confirm` and it `timeout`s
+  because the user is asleep, that's the system working: **abort**, don't
+  proceed.
+
 ## When the device is unavailable
 
 All three tools return `"unavailable: <reason>"` when the Cardputer is off or out
-of BLE range. For `notify`/`ask`, degrade silently to normal chat behavior. For
-`confirm`, the unavailable case is a hard stop (see §1) — never treat an
-unreachable safety device as implicit approval.
+of BLE range (and a cloud call also fails if the bridge daemon or tunnel is
+down). For `notify`/`ask`, degrade silently to normal chat behavior. For
+`confirm`, the unavailable case is a **hard stop** (see §1) — never treat an
+unreachable safety device, a sleeping laptop, or a dead tunnel as implicit
+approval. Fail closed, every time.
 
 ## What this skill is not
 

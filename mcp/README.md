@@ -73,9 +73,15 @@ Two reasons:
    the interaction feels instant.
 2. **No new secrets.** Stdio runs as the user. The MCP client (Claude
    Code) talks to the device via BLE locally; nothing transits the
-   public internet. The Worker-bridged HTTPS transport will land
-   later for cloud agents that can't reach BLE (Managed Agents
-   sessions, claude.ai with the MCP connector).
+   public internet.
+
+**Update (iter 5):** cloud agents that can't reach BLE are now served by
+a second transport — a streamable-http daemon exposed through an
+Anthropic **MCP tunnel** (outbound-only; no inbound ports). Local Claude
+Code can use it too (`claude mcp add --transport http`), unifying both
+onto one BLE owner and one physical `confirm` gate. The bespoke
+Worker-bridge plan was dropped in favor of the tunnel. Setup lives in
+[`/tunnel/`](../tunnel/); design in [`/docs/superpowers/`](../docs/superpowers/).
 
 ## Install + first run
 
@@ -226,11 +232,17 @@ but its gesture is less polished than the brand promised.
 - [x] iter 1: scaffold with stubbed transport
 - [x] iter 2: real BLE transport; `notify` and `ask` end-to-end
 - [x] iter 3: `confirm` with hold-Y-3s physical gesture
-- [ ] iter 4: per-agent tags + rate limit; DND switch; `show`
-      (ambient line on LCD); `dictate` (mic → Worker/Whisper → text)
-- [ ] iter 5: Worker-bridged HTTPS MCP for cloud agents
+- [~] iter 4: DND switch ✅ + per-agent identity on the banner ✅;
+  `show` (ambient line) / `dictate` (mic → Whisper) still pending
+- [x] iter 5: **cloud agents via MCP tunnel** — a streamable-http daemon
+      (`CARDPUTER_HTTP=1`) behind `cloudflared` + `mcp-proxy`, reached by
+      Managed Agents / the Messages API. Replaces the originally-planned
+      bespoke Worker bridge with Anthropic's productized MCP tunnel. See
+      `/tunnel/` and `/docs/superpowers/`.
 - [ ] iter 6: inverse direction — programmable launcher buttons
       that fire Managed Agents tasks
+- [ ] later: signed-consent receipts, on-device action diff, multi-party
+      quorum (documented future ladder in the design spec)
 
 ## License
 

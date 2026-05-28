@@ -23,8 +23,17 @@ that turn the Cardputer into a hand-held Claude device:
   with a colored banner + speaker chirp (`notify`), ask a
   multiple-choice question you answer on the QWERTY (`ask`), or
   demand a physical gesture for destructive operations (`confirm`).
-  Local stdio MCP server + BLE-GATT peripheral — no cloud, no
-  Wi-Fi required.
+  Runs locally over stdio/BLE — no cloud, no Wi-Fi required — **and
+  now over an [MCP tunnel] so cloud agents (Managed Agents, the
+  Messages API) can reach the device in your pocket too.** The
+  hold-to-confirm gesture becomes a **hardware approval key**: an
+  autonomous cloud agent physically cannot run an irreversible
+  operation without your thumb on the device — no prompt injection
+  can synthesize a sustained keypress, and an unreachable device
+  fails closed (the agent stops, never auto-proceeds).
+
+[MCP tunnel]: https://platform.claude.com/docs/en/agents-and-tools/mcp-tunnels/overview
+
 - **Hello / Snake** — minimal example app + a snake game so the bundle
   isn't all serious business.
 
@@ -38,18 +47,19 @@ that turn the Cardputer into a hand-held Claude device:
 
 ## What's new in this fork
 
-| Addition                         | Where                                                                                        | What it does                                                                                                                                                                                                                                                                                                   |
-| -------------------------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Cardputer MCP (host bridge)**  | [`mcp/`](mcp/)                                                                               | Stdio Model Context Protocol server (`bleak`-based) that any Claude or MCP client can register. Three tools: `notify`, `ask`, `confirm`. Talks BLE to the device app — no cloud, no Wi-Fi required.                                                                                                            |
-| **Cardputer MCP (device app)**   | [`buddy/device/apps/cardputer_mcp.py`](buddy/device/apps/cardputer_mcp.py)                   | BLE GATT peripheral on a fresh service UUID block (`a5cd0001-…`), distinct from Buddy's NUS. Renders notifications, ask-question modals, and a hold-Y confirmation gesture; sends acks via TX notifications.                                                                                                   |
-| **Cloudflare Worker relay**      | [`worker/`](worker/)                                                                         | Auth-gated edge endpoint. Whisper for STT, Claude Haiku 4.5 for the reply, Workers KV for per-device conversation memory (last 8 messages, 24 h TTL).                                                                                                                                                          |
-| **Voice + chat app**             | [`buddy/device/apps/push_to_claude.py`](buddy/device/apps/push_to_claude.py)                 | On-device client. Streams WAV to the Worker as it records (flat RAM footprint), text-fallback mode, scrollable replies, `/reset` shortcut.                                                                                                                                                                     |
-| **Pager device app**             | [`buddy/device/apps/pager.py`](buddy/device/apps/pager.py)                                   | Three-screen UI (Compose / Inbox / Detail) for firing and triaging Managed Agents sessions from the QWERTY. Long-polls the Worker for live event ticker.                                                                                                                                                       |
-| **SessionRouter Durable Object** | [`worker/src/router.do.js`](worker/src/router.do.js)                                         | One DO per Anthropic session. Lazily polls the Managed Agents `events.list` endpoint, mirrors events into DO storage, and serves both the Pager (poll) and Console (SSE).                                                                                                                                      |
-| **Central Console (browser)**    | [`worker/src/console.html`](worker/src/console.html)                                         | Single-file dark-theme HTML console served from the Worker. Live event stream, syntax-highlighted bash, inline diffs for `str_replace`, file pills, interrupt + reply. Token-gated, no build step.                                                                                                             |
-| **Mac artifact sync**            | [`mac/claude-pull`](mac/claude-pull) + [`launchd plist`](mac/com.claude.pager.pull.plist)    | Stdlib Python script run every 60 s by launchd. Pulls each session's `/workspace/out/` files into `~/ClaudeRuns/<title>-<id>/` and posts a banner notification when a session completes.                                                                                                                       |
-| **Externalized device config**   | [`buddy/device/apps/config.example.py`](buddy/device/apps/config.example.py)                 | Worker URL + device secret loaded from a gitignored `config.py` so secrets never enter the repo.                                                                                                                                                                                                               |
-| **Cardputer Companion skill**    | [`.claude/skills/cardputer-companion/SKILL.md`](.claude/skills/cardputer-companion/SKILL.md) | Instructions-only Agent Skill. The behavioral counterpart to the MCP server: it teaches Claude _when_ to reach for `notify`/`ask`/`confirm` and _how_ to format for the 240×135 LCD — mandating physical `confirm` before irreversible ops, buzzing only on long-task completion, and otherwise staying quiet. |
+| Addition                         | Where                                                                                        | What it does                                                                                                                                                                                                                                                                                                       |
+| -------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Cardputer MCP (host bridge)**  | [`mcp/`](mcp/)                                                                               | Model Context Protocol server (`bleak`-based) that any Claude/MCP client can register, over **stdio or streamable-http**. Three tools: `notify`, `ask`, `confirm`. Talks BLE to the device app.                                                                                                                    |
+| **MCP tunnel + HTTP daemon**     | [`mcp/auth.py`](mcp/auth.py) + [`tunnel/`](tunnel/) + [`mac/`](mac/)                         | The cloud-bridge path. `CARDPUTER_HTTP=1` runs the same server as a bearer-authed streamable-http daemon (launchd); `tunnel/` (cloudflared + mcp-proxy) exposes it through an Anthropic [MCP tunnel] so Managed Agents / the Messages API can `notify`/`ask`/`confirm` on the device — outbound-only, fail-closed. |
+| **Cardputer MCP (device app)**   | [`buddy/device/apps/cardputer_mcp.py`](buddy/device/apps/cardputer_mcp.py)                   | BLE GATT peripheral on a fresh service UUID block (`a5cd0001-…`), distinct from Buddy's NUS. Renders notifications, ask-question modals, and a hold-Y confirmation gesture; sends acks via TX notifications.                                                                                                       |
+| **Cloudflare Worker relay**      | [`worker/`](worker/)                                                                         | Auth-gated edge endpoint. Whisper for STT, Claude Haiku 4.5 for the reply, Workers KV for per-device conversation memory (last 8 messages, 24 h TTL).                                                                                                                                                              |
+| **Voice + chat app**             | [`buddy/device/apps/push_to_claude.py`](buddy/device/apps/push_to_claude.py)                 | On-device client. Streams WAV to the Worker as it records (flat RAM footprint), text-fallback mode, scrollable replies, `/reset` shortcut.                                                                                                                                                                         |
+| **Pager device app**             | [`buddy/device/apps/pager.py`](buddy/device/apps/pager.py)                                   | Three-screen UI (Compose / Inbox / Detail) for firing and triaging Managed Agents sessions from the QWERTY. Long-polls the Worker for live event ticker.                                                                                                                                                           |
+| **SessionRouter Durable Object** | [`worker/src/router.do.js`](worker/src/router.do.js)                                         | One DO per Anthropic session. Lazily polls the Managed Agents `events.list` endpoint, mirrors events into DO storage, and serves both the Pager (poll) and Console (SSE).                                                                                                                                          |
+| **Central Console (browser)**    | [`worker/src/console.html`](worker/src/console.html)                                         | Single-file dark-theme HTML console served from the Worker. Live event stream, syntax-highlighted bash, inline diffs for `str_replace`, file pills, interrupt + reply. Token-gated, no build step.                                                                                                                 |
+| **Mac artifact sync**            | [`mac/claude-pull`](mac/claude-pull) + [`launchd plist`](mac/com.claude.pager.pull.plist)    | Stdlib Python script run every 60 s by launchd. Pulls each session's `/workspace/out/` files into `~/ClaudeRuns/<title>-<id>/` and posts a banner notification when a session completes.                                                                                                                           |
+| **Externalized device config**   | [`buddy/device/apps/config.example.py`](buddy/device/apps/config.example.py)                 | Worker URL + device secret loaded from a gitignored `config.py` so secrets never enter the repo.                                                                                                                                                                                                                   |
+| **Cardputer Companion skill**    | [`.claude/skills/cardputer-companion/SKILL.md`](.claude/skills/cardputer-companion/SKILL.md) | Instructions-only Agent Skill. The behavioral counterpart to the MCP server: it teaches Claude _when_ to reach for `notify`/`ask`/`confirm` and _how_ to format for the 240×135 LCD — mandating physical `confirm` before irreversible ops, buzzing only on long-task completion, and otherwise staying quiet.     |
 
 See [`worker/README.md`](worker/README.md) for the full Cloudflare deploy
 guide.
@@ -100,9 +110,10 @@ Done. Power the device on/off with the side switch.
 ## Quick start — Cardputer MCP (let any agent reach the device)
 
 Turn the Cardputer into a pocket pager that any MCP-speaking client
-— Claude Code, Claude Desktop, Cursor, Codex, Managed Agents (via
-the future HTTPS bridge), or anything that supports the Model
-Context Protocol — can reach. Three tools land on first connect:
+— Claude Code, Claude Desktop, Cursor, Codex, Managed Agents (via the
+[MCP tunnel](#quick-start--cardputer-over-mcp-tunnels-cloud-agents)
+below), or anything that supports the Model Context Protocol — can
+reach. Three tools land on first connect:
 
 - `cardputer.notify(title, body, urgency)` — flash a banner on the
   device and chirp the speaker. Urgency colors the header
@@ -227,6 +238,89 @@ See [`mcp/README.md`](mcp/README.md) for the full architecture
 notes, wire-protocol pointer, known limitations, and roadmap;
 the BLE wire format lives in
 [`buddy/references/mcp_protocol.md`](buddy/references/mcp_protocol.md).
+
+---
+
+## Quick start — Cardputer over MCP tunnels (cloud agents)
+
+The local stdio path above only works for an agent running on the same
+laptop. **MCP tunnels** extend the device to **cloud Claude** — a
+[Managed Agents] session in the Console or a Messages-API agent — so an
+autonomous agent grinding through a 40-minute job in the cloud can buzz
+the device in your pocket and, crucially, **demand a physical hold-Y
+before any irreversible step**. The cloud literally cannot type on the
+Cardputer's keyboard, so no prompt injection or runaway loop can forge
+consent; if the device is unreachable the agent **fails closed** and
+stops. It's a hardware approval key for AI.
+
+```
+ cloud Claude            your Mac (always-on)
+ (Managed Agent  ─tunnel─▶  cloudflared ─▶ mcp-proxy ─▶ 127.0.0.1:9000 ─BLE─▶ Cardputer
+  / Messages API)  outbound-only           (Docker)     cardputer-mcp daemon
+```
+
+The same daemon also serves **local Claude Code** over loopback, so one
+BLE owner and one physical gate covers cloud and local agents alike.
+
+[Managed Agents]: https://platform.claude.com/docs/en/managed-agents/overview
+
+### What you need
+
+- **MCP tunnels + Managed Agents beta access** (request in the Console).
+  Tunnels work from Console Managed Agents and the Messages API — **not**
+  the claude.ai consumer app.
+- **Docker Desktop** and the device flashed with `cardputer_mcp`.
+
+### Setup (≈10 min, one-time)
+
+1. **Run the always-on bridge daemon** (owns the BLE link, serves
+   streamable-http on `127.0.0.1:9000`):
+
+   ```bash
+   ./mac/install_cardputer_bridge.sh        # writes a stub env, exits
+   $EDITOR ~/.config/cardputer-bridge/env   # set random tokens + tunnel domain
+   ./mac/install_cardputer_bridge.sh        # renders + loads the launchd agent
+   ```
+
+   Approve the one-time macOS Bluetooth prompt for the daemon.
+
+2. **Point local Claude Code at the same daemon** (unified gate — the
+   installer prints this with your token filled in):
+
+   ```bash
+   claude mcp add --transport http cardputer \
+       http://127.0.0.1:9000/mcp \
+       --header "Authorization: Bearer <your-local-token>"
+   ```
+
+3. **Stand up the tunnel** and attach it to a cloud agent — full
+   walkthrough (Console steps, cert generation, Managed-Agent +
+   Messages-API usage, and a 6-step verification checklist) in
+   [`tunnel/README.md`](tunnel/README.md):
+
+   ```bash
+   cd tunnel
+   cp env.example .env && $EDITOR .env      # TUNNEL_DOMAIN + TUNNEL_TOKEN
+   ./gen-certs.sh                           # CA + server cert; upload data/ca.crt in Console
+   docker compose up -d
+   ```
+
+   Then attach `https://cardputer.<your-tunnel-domain>/mcp` (with your
+   cloud bearer token) to a Managed Agent and ask it to confirm a
+   destructive op — the device flashes red with `from:managed-agent`,
+   you hold Y, the agent proceeds.
+
+### Security model in one breath
+
+Outbound-only (no inbound ports); inner TLS terminated by a cert **only
+you** hold (Cloudflare can't read payloads); a **bearer token** on the
+daemon gates the otherwise-unauthenticated tunnel and labels which agent
+is asking; the **physical gesture** is the un-forgeable consent; and
+**fail-closed** means a dark device is never a yes. The
+[`cardputer-companion`](.claude/skills/cardputer-companion/SKILL.md)
+skill teaches Claude to honor all of this. Signed-consent receipts,
+on-device action diffs, and multi-person quorum are documented as a
+future ladder in [`docs/superpowers/`](docs/superpowers/).
 
 ---
 
