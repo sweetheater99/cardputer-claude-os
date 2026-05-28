@@ -11,3 +11,7 @@ venv/
 buddy/device/apps/config.py
 worker/.dev.vars
 worker/.wrangler/
+
+# MicroPython bytecode build artifacts (compile-on-push via mpy-cross,
+# not source-of-truth — the .py is canonical).
+*.mpy

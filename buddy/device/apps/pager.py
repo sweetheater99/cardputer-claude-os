@@ -36,6 +36,23 @@ import M5
 import machine
 from hardware import MatrixKeyboard
 
+# Persistent-connection HTTPS client. Replaces ``requests`` per-call
+# socket churn — the same TLS handshake (~1-2 s on this build) is
+# reused for every pager poll and detail long-poll. See
+# buddy/device/http_pool.py for the rationale. Lives at /flash/.
+try:
+    import http_pool as _pool  # type: ignore
+except Exception as e:
+    print("pager: http_pool unavailable, falling back to requests:", e)
+    _pool = None
+
+# WiFi watchdog. Called from idle loops; ensures we don't get stuck
+# on a dropped link without the user knowing why pager polls fail.
+try:
+    import wifi_event as _wifi  # type: ignore
+except Exception:
+    _wifi = None
+
 
 # ---- DEPLOYMENT CONFIG ----------------------------------------------
 
@@ -49,6 +66,30 @@ except Exception:
 
 _WORKER_BASE = (getattr(_cfg, "WORKER_BASE", "") if _cfg else "").rstrip("/")
 DEVICE_SECRET = getattr(_cfg, "DEVICE_SECRET", "") if _cfg else ""
+DEVICE_PIN = getattr(_cfg, "DEVICE_PIN", "") if _cfg else ""
+
+# Hotkey presets — type the key and hit Enter, buffer expands to full prompt
+# before sending. Keeps the Cardputer's tiny keyboard fast for common ops.
+PRESETS = {
+    "w": "whoop today: recovery, strain, sleep — read from pi dashboard",
+    "f": "forex bot P&L today + open positions + last trade",
+    "p": "pi health: disk, journal size, services up, recent crashes",
+    "m": "milemarkt new buyer messages from supabase mm_messages",
+    "r": "mostly_chill_tbh recent comments + upvote totals from reddit",
+    "n": "networth dashboard total + delta today from pi :8501",
+    "a": "award radar inbox top 5 unread from supabase award table",
+    "?": "list all available skills and their short triggers",
+}
+
+# Patterns that look like real-money spend — trigger an on-device Y/N
+# confirmation before sending. Cardputer typing is fast enough that
+# typos like 'swiggy 1000' instead of '100' are a real risk.
+_BRAND_RE = ("swiggy", "amazon", "starbucks", "flipkart", "myntra",
+             "bigbasket", "nykaa", "blinkit", "zomato", "tatacliq",
+             "lifestyle", "ajio", "shoppers", "cleartrip", "yatra",
+             "easemytrip", "ola", "uber", "pvr", "inox", "decathlon",
+             "ikea", "croma", "tanishq", "kfc", "dominos", "pizzahut",
+             "gyftr", "buy")
 
 URL_SPAWN = _WORKER_BASE + "/pager/spawn"
 URL_SESSIONS = _WORKER_BASE + "/pager/sessions"
@@ -89,12 +130,31 @@ def _hdrs(extra=None):
     return h
 
 
+# Latency tracking for the live status pip. Last successful request's
+# round-trip in ms; surfaced in the header as "online · 80ms" etc.
+_last_rtt_ms = 0
+_last_req_ok = True
+
+
 def _http_json(method, url, body=None, timeout=15):
-    """Request → (status, parsed_json_or_text). Always wraps in
-    try/except so a transient socket error becomes a structured
-    failure rather than an uncaught exception that drops us back
-    to the launcher.
-    """
+    """Request → (status, parsed_json_or_text). Routes through the
+    persistent-connection pool if available; falls back to one-shot
+    ``requests`` calls otherwise. Always wraps transport errors as
+    ``(0, "transport: ...")`` for the same contract the rest of the
+    file already handles."""
+    global _last_rtt_ms, _last_req_ok
+    t0 = time.ticks_ms()
+    if _pool is not None:
+        # Pool handles JSON encode + content-type; we just pass dict.
+        status, value = _pool.request_json(
+            method, url, body=body, headers=_hdrs(),
+            timeout_ms=timeout * 1000,
+        )
+        _last_rtt_ms = time.ticks_diff(time.ticks_ms(), t0)
+        _last_req_ok = (status != 0)
+        return status, value
+
+    # Fallback: legacy urequests path.
     import requests
     try:
         if method == "GET":
@@ -103,6 +163,7 @@ def _http_json(method, url, body=None, timeout=15):
             data = json.dumps(body or {}).encode("utf-8")
             r = requests.post(url, data=data, headers=_hdrs(), timeout=timeout)
     except Exception as e:
+        _last_req_ok = False
         return 0, "transport: {}".format(e)
 
     status = r.status_code
@@ -116,12 +177,55 @@ def _http_json(method, url, body=None, timeout=15):
     except Exception:
         pass
 
+    _last_rtt_ms = time.ticks_diff(time.ticks_ms(), t0)
+    _last_req_ok = True
     if not text:
         return status, {}
     try:
         return status, json.loads(text)
     except Exception:
         return status, text
+
+
+# --- WiFi watchdog ---------------------------------------------------
+# Cheap to call every idle tick; ensure_connected throttles internally.
+# When the link recovers, drop pool sockets so we don't try to reuse a
+# TCP underlay that died with the WiFi association.
+
+def _tick_wifi():
+    if _wifi is None:
+        return
+    state = _wifi.ensure_connected()
+    if state == "reconnected" and _pool is not None:
+        try:
+            _pool.drop_all()
+        except Exception:
+            pass
+
+
+def _live_pip():
+    """Build the header status pip (text, color) from current WiFi +
+    last-request state. Surfaces RSSI bars + RTT so the user can tell
+    at a glance whether the network or the agent is the slow part."""
+    if _wifi is not None and not _wifi.is_connected():
+        return ("OFFLINE", _RED)
+    if not _last_req_ok:
+        return ("ERR", _RED)
+    rssi = _wifi.rssi() if _wifi is not None else None
+    bars = "..."
+    if rssi is not None:
+        # -50 strong / -65 ok / -78 weak / worse → very weak
+        if rssi >= -55:
+            bars = "###"
+        elif rssi >= -68:
+            bars = "##-"
+        elif rssi >= -78:
+            bars = "#--"
+        else:
+            bars = "..."
+    if _last_rtt_ms:
+        return ("{} {}ms".format(bars, _last_rtt_ms), _GREEN)
+    return (bars, _GREEN)
 
 
 # ---- Drawing helpers ------------------------------------------------
@@ -407,10 +511,11 @@ def _summarize_subline(summary):
 # =====================================================================
 
 def _draw_compose(buf, cursor_on, status_msg=None, status_color=_GREEN):
+    pip = ("NO URL", _RED) if not _WORKER_BASE else _live_pip()
     _draw_chrome(
         "Pager Compose",
         "Enter send  -> inbox  Q exit",
-        status_pip=("ONLINE", _GREEN) if _WORKER_BASE else ("NO URL", _RED),
+        status_pip=pip,
     )
     _LCD.setTextSize(1)
     _LCD.setTextColor(_GRAY_MID, _BLACK)
@@ -452,6 +557,11 @@ def _run_compose(kb):
             cursor_on = not cursor_on
             _draw_compose(buf, cursor_on, status_msg, status_color)
             last_blink = now
+        # WiFi watchdog — cheap when connected, throttled retries
+        # when not. Run on every loop tick so dropped links are
+        # caught within a few seconds rather than on next user
+        # request.
+        _tick_wifi()
         # Notification poller — repaints if a banner fired.
         if _notif_tick():
             _draw_compose(buf, cursor_on, status_msg, status_color)
@@ -469,6 +579,15 @@ def _run_compose(kb):
             prompt = buf.strip()
             if not prompt:
                 continue
+            # Expand single-char preset to full prompt (e.g. "w" -> "whoop ...")
+            prompt = _expand_preset(prompt)
+            # Spend guard: require Y/N confirmation on real-money patterns
+            if _looks_like_spend(prompt):
+                if not _confirm_spend(kb, prompt):
+                    status_msg = "cancelled"
+                    status_color = _GRAY_MID
+                    _draw_compose(buf, True, status_msg, status_color)
+                    continue
             status_msg = "launching..."
             status_color = _ORANGE
             _draw_compose(buf, True, status_msg, status_color)
@@ -512,10 +631,11 @@ def _fetch_sessions():
 
 
 def _draw_inbox(sessions, cursor, scroll_top, err=None):
+    pip = ("ERR", _RED) if err else _live_pip()
     _draw_chrome(
         "Pager · Inbox",
         "<- compose  Enter open  D del",
-        status_pip=("LIVE", _GREEN) if not err else ("ERR", _RED),
+        status_pip=pip,
     )
     _LCD.setTextSize(1)
 
@@ -653,6 +773,8 @@ def _run_inbox(kb):
             last_refresh = now
             _draw_inbox(sessions, cursor, scroll_top, err)
             gc.collect()
+        # WiFi watchdog runs every iteration; throttles internally.
+        _tick_wifi()
         # Notification poller. Inbox already shows session statuses, so
         # the banner is mostly redundant here, but it gives audio +
         # consistency across screens.
@@ -896,6 +1018,8 @@ def _run_detail(kb, sid):
             err = "auth rejected"
 
         _draw_detail(meta, summary, recent, err)
+        # WiFi watchdog between long-poll cycles.
+        _tick_wifi()
         # Cross-session notification poll (this session's status is
         # already implied by what we just rendered).
         if _notif_tick():
@@ -1024,14 +1148,138 @@ def _config_check():
     return True
 
 
+def _expand_preset(buf):
+    """If buf is a single-char preset trigger, return the full prompt.
+    Otherwise return buf unchanged."""
+    s = buf.strip()
+    if len(s) == 1 and s in PRESETS:
+        return PRESETS[s]
+    return buf
+
+
+def _looks_like_spend(prompt):
+    """Heuristic: prompt looks like a real-money spend → confirm first.
+    Matches '<brand> <amount>' where brand is in the known list and
+    amount is a 2-5 digit number."""
+    p = prompt.strip().lower()
+    parts = p.split()
+    if len(parts) < 2:
+        return False
+    has_brand = any(b in parts[0] or parts[0] in b for b in _BRAND_RE)
+    if not has_brand:
+        # Also catch "buy X 250" two-word lead
+        if len(parts) >= 3 and parts[0] == "buy":
+            has_brand = True
+    if not has_brand:
+        return False
+    # last token should be digits-only between 10 and 99999
+    last = parts[-1].replace(",", "").replace("₹", "").strip()
+    if not last.isdigit():
+        return False
+    n = int(last)
+    return 10 <= n <= 99999
+
+
+def _confirm_spend(kb, prompt):
+    """Show a Y/N confirm screen for a spend prompt. Return True on Y."""
+    _LCD.fillScreen(_BLACK)
+    _LCD.setTextSize(1)
+    _LCD.setTextColor(_RED, _BLACK)
+    _LCD.drawString("CONFIRM SPEND", 6, 6)
+    _LCD.setTextColor(_CREAM, _BLACK)
+    # Wrap the prompt across up to 4 lines
+    for i, line in enumerate(_wrap_lines(prompt, _W - 12, 1)[:4]):
+        _LCD.drawString(line, 6, 24 + i * 12)
+    _LCD.setTextColor(_GREEN, _BLACK)
+    _LCD.drawString("Y = send", 6, _H - 30)
+    _LCD.setTextColor(_RED, _BLACK)
+    _LCD.drawString("N / ESC = cancel", 6, _H - 16)
+    while True:
+        kb.tick()
+        k = kb.get_key()
+        if k is None:
+            time.sleep_ms(40)
+            continue
+        ch = _to_char(k)
+        if ch and ch.lower() == "y":
+            return True
+        if ch and ch.lower() == "n":
+            return False
+        if _is_esc(k):
+            return False
+
+
+def _draw_pin(entry, attempts, locked=False):
+    _LCD.fillScreen(_BLACK)
+    _LCD.setTextSize(1)
+    _LCD.setTextColor(_GREEN, _BLACK)
+    _LCD.drawString("Cardputer PIN", 6, 18)
+    _LCD.setTextSize(2)
+    _LCD.setTextColor(_CREAM, _BLACK)
+    n = len(DEVICE_PIN)
+    dots = "* " * len(entry) + "_ " * (n - len(entry))
+    _LCD.drawString(dots.strip(), 6, 50)
+    _LCD.setTextSize(1)
+    if attempts > 0 and not locked:
+        _LCD.setTextColor(_RED, _BLACK)
+        _LCD.drawString("wrong. {}/3".format(attempts), 6, 92)
+    if locked:
+        _LCD.setTextColor(_RED, _BLACK)
+        _LCD.drawString("LOCKED — power cycle", 6, 92)
+
+
+def _pin_gate(kb):
+    """Return True iff user enters the correct PIN. Three wrong attempts
+    locks the device until power-cycled."""
+    if not DEVICE_PIN:
+        return True
+    attempts = 0
+    while attempts < 3:
+        entry = ""
+        _draw_pin(entry, attempts)
+        while len(entry) < len(DEVICE_PIN):
+            kb.tick()
+            k = kb.get_key()
+            if k is None:
+                time.sleep_ms(40)
+                continue
+            ch = _to_char(k)
+            if ch and ch.isdigit():
+                entry += ch
+                _draw_pin(entry, attempts)
+            elif _is_backspace(k) and entry:
+                entry = entry[:-1]
+                _draw_pin(entry, attempts)
+            elif _is_esc(k):
+                return False
+        if entry == DEVICE_PIN:
+            return True
+        attempts += 1
+        if attempts < 3:
+            time.sleep_ms(800)
+    _draw_pin("", 3, locked=True)
+    while True:
+        time.sleep_ms(500)
+
+
 def main():
     _set_font()
     if not _config_check():
         return
     kb = MatrixKeyboard()
+    if not _pin_gate(kb):
+        return
     # The launcher already debounced its Enter; small extra settle.
     time.sleep_ms(150)
     gc.collect()  # reclaim parse-time allocations before screen loop
+
+    # NOTE: don't eagerly warm the TLS pool here. The mbedTLS handshake
+    # against Cloudflare on this build takes 25-40 s, which would block
+    # the UI with no feedback. Instead, let the first organic request
+    # (compose-launch or inbox-refresh) pay the handshake while showing
+    # its own progress message ("launching..." / "LIVE"); every
+    # subsequent request reuses the warm connection at ~8 s vs the
+    # ~25 s urequests baseline. Net win for any session with >1 call.
 
     screen = "compose"
     payload = None
