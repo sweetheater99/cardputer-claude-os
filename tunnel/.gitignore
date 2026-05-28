@@ -1,0 +1,3 @@
+# Never commit secrets or key material.
+.env
+data/
